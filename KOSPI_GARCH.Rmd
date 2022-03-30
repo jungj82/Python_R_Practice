@@ -1,0 +1,187 @@
+---
+title: "KOSPI_GARCH"
+author: "Ji Jung"
+date: "3/25/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+이상 현상 탐지(anomaly detection)란 특이값(Outlier)를 탐지하는 기법입니다.
+이번에는 코로나 사태 이후 KOSPI에서 발생한 특이값을 탐지하고 그리고 GARCH기법을 이용해서 
+미래 주가의 분산성과 변동성에 대해 예측해보겠습니다.
+
+이상 현상 탐지에는 anomalize 패키지가 쓰입니다.
+우선 이번에 쓰일 코스피는 2020-01-01 이후입니다. 
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(quantmod) # Reads Stock Data
+library(tidyverse) 
+library(dplyr)
+library(zoo)
+library(xts)
+library(anomalize) # Anomalies Detection
+library(FinTS) # ARCH Testing
+library(tseries) # ADF testing
+library(TSA)
+library(prophet)
+library(rugarch) # GARCH 
+library(fGarch)
+library(forecast)
+library(ggplot2)
+```
+# Part 1 코스피 주가 이상 현상 탐지 (Anomaly Detection)
+### 코스피 주가 불러오기
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+KOSPI_source <- getSymbols("^KS11", from="2020-01-01", to="2022-03-24", env = NULL,auto.assign=FALSE)
+```
+
+```{r}
+chartSeries(KOSPI_source, name = 
+              "KOSPI Composite Index Prices From 2020-01-01 to 2022-03-24")
+```
+
+### Data Transformation
+```{r}
+KOSPI <- Cl(KOSPI_source)
+names(KOSPI) <- "KOSPI"
+dates <- index(KOSPI)
+KOSPI <- as.data.frame(KOSPI)
+KOSPI <- cbind(date = dates, KOSPI)
+```
+### Convert dataframe to a tibble
+```{r message=FALSE, warning=FALSE}
+KOSPI_ts<- as.tibble(KOSPI)
+class(KOSPI_ts)
+```
+get_time_scale_template()는 데이터의 스케일에 따라 논리적으로 frequency와 trend 범위를 결정할 수 있는 명령어입니다. 
+```{r}
+get_time_scale_template()
+```
+
+### Adjusting Local Parameters
+
+```{r message=FALSE, warning=FALSE}
+KOSPI_ts_anomalized <- KOSPI_ts %>%
+  time_decompose(KOSPI, merge = TRUE,
+                 method    = "stl",
+                 frequency = "1 week",
+                 trend     = "3 months") %>%
+  anomalize(remainder,alpha = 0.05, max_anoms = 0.2) %>%
+  time_recompose()
+```
+### Including Plots
+
+```{r}
+KOSPI_stl <- KOSPI_ts_anomalized %>%
+  plot_anomaly_decomposition() +
+  ggtitle("Adjusted")
+KOSPI_stl
+```
+```{r}
+KOSPI_ts_anomalized %>%   
+  plot_anomalies(time_recomposed = TRUE) +
+  ggtitle("Alpha = 0.05")
+```
+
+### Extracting the Anomalous Data Points
+```{r}
+KOSPI_Anomalous_Data_Points <- KOSPI_ts_anomalized %>% dplyr::filter(anomaly == 'Yes')
+KOSPI_Anomalous_Data_Points
+```
+
+## Part 2 GARCH 모델로 KOSPI 주가변동성 예측
+
+Part 2에서는 GARCH 모델을 기반으로 KOSPI 주가의 분산을 예측해보겠습니다. 
+주가의 분산도가 클면 변동성에도 영향을 미치며, 이 변동성을 예측하기 위한 모델이 GARCH입니다.
+
+### 정상시계열
+Augmented Dickey–Fuller 검정을 실시하여 KOSPI 데이터가 정상시계열인지 확인합니다.
+```{r}
+# Augmented Dickey–Fuller test
+adf.test(KOSPI_source$KS11.Adjusted)
+```
+P-value가 0.7969, 즉 0.05보다 높게 나왔으며 KOSPI 데이터를 변환할 필요성이 생겼습니다.
+분산을 줄이기 위해 로그변환과 차분을 함께 적용하여 평균과 분산이 일정한 정상 시계열로 변환하겠습니다.
+
+```{r include=FALSE}
+lambda = 0
+percentage = 1 
+
+KOSPI.r <- diff(BoxCox(KOSPI_source$KS11.Adjusted, lambda))*percentage 
+KOSPI.r <- KOSPI.r[!is.na(KOSPI.r)] 
+names(KOSPI.r)
+```
+```{r}
+adf.test(KOSPI.r)
+```
+변환된 시계열을 Augmented Dickey–Fuller 검정한 결과 P-value가 0.01보다 적게 나와 정상 시계열로 변환됐음을 알수있습니다.
+
+```{r echo=FALSE}
+ggplot(KOSPI.r, aes(as.Date(time(KOSPI.r)), as.matrix(KOSPI.r))) + 
+  geom_line(colour = "Blue")+ xlab("날짜") + ylab("Index") +
+  ggtitle("KOSPI Daily Return since 2020-01-01 to 2022-03-24")
+```
+### GARCH(1,1) 모형
+```{r include=FALSE}
+garch.11=garch(KOSPI.r, order=c(1,1))
+```
+
+```{r}
+AIC(garch.11)
+```
+```{r}
+plot(residuals(garch.11),type='h',ylab='Standardized Residuals', main='GARCH(1,1)')
+```
+```{r}
+qqnorm(residuals(garch.11)); qqline(residuals(garch.11), col = 2)
+```
+```{r}
+tsdisplay(residuals(garch.11), lag.max = 40, main="GARCH(1,1)")
+```
+```{r}
+gBox(garch.11,method='squared')
+```
+
+모형 적합도(Goodness of fit)를 보면 Squared standardized residuals가 P-value인 0.05보다 높으므로 봐서 GARCH(1,1)모형이 적합합니다. 
+Squared standardized residuals 독립적임을 알수있습니다.
+
+### GARCH 예측 모델
+
+최종 모델 사양 정의
+```{r}
+Garch11.spec <- ugarchspec(mean.model=list(armaOrder=c(1,1)),
+                            variance.model=list(model="gjrGARCH", garchOrder=c(1,1)),
+                            distribution.model = "sstd")
+Garch11.fit <- ugarchfit(spec=Garch11.spec, data=KOSPI.r)
+```
+평균 및 변동성 역학 분석
+```{r}
+setfixed(Garch11.spec) <- as.list(coef(Garch11.fit))
+garch11.filter <- ugarchfilter(data = KOSPI.r, spec = Garch11.spec)
+plot(sigma(garch11.filter))
+```
+미래 수익에 대한 예측 - 30일로 세팅
+```{r echo=FALSE}
+# Make the predictions for the mean and vol for the next 30 days
+garch11.forecast.30 <- ugarchforecast(data = KOSPI.r,
+                                fitORspec = Garch11.spec,
+                                n.ahead = 30)
+
+cbind(fitted(garch11.forecast.30), sigma(garch11.forecast.30))
+```
+Sigma는 예측 변동성 값입니다.
+
+```{r}
+plot(garch11.forecast.30, which=1);plot(garch11.forecast.30, which=3)
+```
+## Forecasting using Bootstrap
+```{r}
+forecast_boot <- ugarchboot(Garch11.fit,data = na.omit(KOSPI.r), method = c("Partial", "Full")[1], n.ahead = 30, n.bootpred = 500)
+plot(forecast_boot,which=2);plot(forecast_boot,which=3)
+```
+
